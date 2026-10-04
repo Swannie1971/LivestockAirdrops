@@ -1,6 +1,6 @@
 # Livestock Airdrops
 
-An Oxide/uMod plugin for **Rust** that turns custom supply signals into livestock deliveries. A player throws a livestock signal, a cargo plane flies over, and a live **cow, bull, sheep, ram, lamb or calf** floats down under a bunch of party balloons, ready to be led home.
+An Oxide/uMod (and Carbon) plugin for **Rust** that turns custom supply signals into livestock deliveries. A player throws a livestock signal, a cargo plane flies over, and a live **cow, bull, sheep, ram, lamb or calf** floats down under a bunch of party balloons, ready to be led home.
 
 ![Livestock signal icons](icons/preview.png)
 
@@ -17,13 +17,13 @@ An Oxide/uMod plugin for **Rust** that turns custom supply signals into livestoc
 
 ## Requirements
 
-- A Rust server running **Oxide/uMod**.
+- A Rust server running **Oxide/uMod** or **Carbon** (tested on Carbon 2.0.262).
 - A Rust version with the **Gen2 livestock** (`assets/rust.ai/agents/cow`, `sheep`, `calf`, …). On load the plugin warns about any prefab path that doesn't exist on the server.
 
 ## Installation
 
-1. Copy `LivestockAirdrops.cs` into `oxide/plugins/`.
-2. The plugin creates `oxide/config/LivestockAirdrops.json` with working defaults, including the Workshop icon IDs.
+1. Copy `LivestockAirdrops.cs` into `oxide/plugins/` (Carbon: `carbon/plugins/`).
+2. The plugin creates `oxide/config/LivestockAirdrops.json` (Carbon: `carbon/configs/LivestockAirdrops.json`) with working defaults, including the Workshop icon IDs.
 3. Give staff the permission: `oxide.grant group admin livestockairdrops.admin`
 
 ## Commands
@@ -36,7 +36,7 @@ An Oxide/uMod plugin for **Rust** that turns custom supply signals into livestoc
 
 ## Configuration
 
-`oxide/config/LivestockAirdrops.json`:
+`oxide/config/LivestockAirdrops.json` (Carbon: `carbon/configs/LivestockAirdrops.json`):
 
 ### General Settings
 
