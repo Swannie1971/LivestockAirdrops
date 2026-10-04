@@ -13,3 +13,7 @@ icons/tagtool/
 # Build output
 bin/
 obj/
+
+# Local Codefling submission material and loose copies
+codefling/
+/preview.png
