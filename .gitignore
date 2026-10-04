@@ -1,0 +1,15 @@
+# Other plugins, and server configs/data copied here for reference
+_ProductionServer/
+PermissionsManager.cs
+shop/
+*.orig
+
+# Steam Workshop submissions and tooling (steamcmd/ also holds Steam login data)
+steamcmd/
+icons/workshop/
+icons/upload_icon.bat
+icons/tagtool/
+
+# Build output
+bin/
+obj/
