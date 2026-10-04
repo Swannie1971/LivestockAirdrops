@@ -120,7 +120,8 @@ Example for **Shop UI** by David (`oxide/data/Shop/Commands.json`), with the ite
 
 ## Credits
 
-- Plugin by Swannie.
+- Idea, design decisions and in-game testing by Swannie.
+- Written with AI assistance: the code, icon tooling and documentation were written by [Claude](https://claude.ai) (Anthropic) through Claude Code, working with Swannie on a live test server.
 - Animal artwork in the icons: [Twemoji](https://github.com/jdecked/twemoji) by Twitter, Inc and contributors, licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). See `icons/twemoji/LICENSE.txt`.
 
 ## License
