@@ -122,3 +122,7 @@ Example for **Shop UI** by David (`oxide/data/Shop/Commands.json`), with the ite
 
 - Plugin by Swannie.
 - Animal artwork in the icons: [Twemoji](https://github.com/jdecked/twemoji) by Twitter, Inc and contributors, licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). See `icons/twemoji/LICENSE.txt`.
+
+## License
+
+The plugin and scripts are released under the [MIT License](LICENSE). The Twemoji artwork in `icons/twemoji/` stays under CC-BY 4.0.
