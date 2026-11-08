@@ -32,6 +32,7 @@ An Oxide/uMod (and Carbon) plugin for **Rust** that turns custom supply signals 
 |---|---|---|
 | `giveanimal <player or SteamID> <animal name>` | Server console / RCON | Gives a livestock signal. Animal names may contain spaces (`Baby Calf`) and partial names work. With no arguments it lists the animals. |
 | `/giveanimal <player> <animal name>` | Chat | Same, for players with `livestockairdrops.admin`. |
+| `/livestockadmin` | Chat | Opens the in-game admin panel for players with `livestockairdrops.admin`: edit animals and drop settings, give signals, start a test drop, watch, land or cancel drops in progress, and review the last 200 drops. |
 | `livestockairdrops.prefabs <words…>` | Server console | Lists the server's prefab paths that contain all the words given, e.g. `livestockairdrops.prefabs rust.ai sheep`. |
 
 ## Configuration
@@ -54,6 +55,7 @@ An Oxide/uMod (and Carbon) plugin for **Rust** that turns custom supply signals 
 | Balloon Height Above Animal | `1.3` | Height of the point where the strings are tied. |
 | Popped Balloons Speed Up Descent | `true` | Each balloon shot off makes the animal fall faster, up to 4×. |
 | Thrower Can Lead Animal Immediately | `true` | The animal trusts the thrower on landing. |
+| Thrower Owns Animal | `true` | The animal belongs to the thrower, like one bought from the game's livestock vendor. |
 | Stop Signal Smoke After Landing (Seconds, -1 = vanilla) | `10` | When the signal smoke ends, counted from the last landing. |
 
 ### Airdrop Configurations (one entry per signal)
@@ -61,6 +63,7 @@ An Oxide/uMod (and Carbon) plugin for **Rust** that turns custom supply signals 
 | Setting | Description |
 |---|---|
 | Animal Name | Item name, and the name used by `giveanimal`. |
+| Limit Per Player Per Wipe (0 = no limit) | How many of this animal each player can call in per wipe. Refunded and cancelled drops don't count. |
 | Signal Skin ID | How the plugin recognises the signal, and the source of its icon. Must be unique per animal. |
 | Prefab Path | The animal to spawn (the female prefab, for species with separate prefabs). |
 | Sex (Random, Male, Female) | For sheep and lamb (one prefab for both sexes) and for species with a male prefab. |

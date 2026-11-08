@@ -1,13 +1,14 @@
 using System.Collections.Generic;
 using System.Linq;
 using Newtonsoft.Json;
+using Oxide.Game.Rust.Cui;
 using Rust.Ai.Gen2;
 using UnityEngine;
 using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("Livestock Airdrops", "Swannie", "1.9.4")]
+    [Info("Livestock Airdrops", "Swannie", "1.10.5")]
     [Description("Skinned supply signals call a cargo plane that drops live livestock, carried down by party balloons.")]
     public class LivestockAirdrops : RustPlugin
     {
@@ -24,6 +25,8 @@ namespace Oxide.Plugins
         private const float BalloonRiseSpeed = 3f;
         private const float BalloonReleaseSeconds = 8f;
         private const float MaxPoppedSpeedMultiplier = 4f;
+        private const string MovedMarkerLabel = "LIVESTOCK";
+        private const float MovedMarkerSeconds = 900f;
 
         private static readonly Color[] BalloonPalette =
         {
@@ -43,6 +46,23 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, KeyValuePair<AnimalConfig, int>> _recentThrows = new Dictionary<ulong, KeyValuePair<AnimalConfig, int>>();
         private readonly List<string> _balloonPrefabs = new List<string>();
         private string _speechBubblePrefab;
+        private readonly Dictionary<ulong, AdminPanelState> _adminPanels = new Dictionary<ulong, AdminPanelState>();
+        // Signals owed to each player. Saved to disk so refunds survive restarts and offline owners.
+        private Dictionary<ulong, List<RefundEntry>> _refunds = new Dictionary<ulong, List<RefundEntry>>();
+        private readonly HashSet<ulong> _refundFullWarned = new HashSet<ulong>();
+        private readonly List<SmokeStop> _smokeStops = new List<SmokeStop>();
+        private readonly List<MovedMarker> _movedMarkers = new List<MovedMarker>();
+        // Drops used this wipe, by player then signal skin. Counted even with no limit set, so a limit added later is accurate.
+        private Dictionary<ulong, Dictionary<ulong, int>> _wipeUses = new Dictionary<ulong, Dictionary<ulong, int>>();
+        private int _nextDropId;
+        private List<DropRecord> _history = new List<DropRecord>();
+        private int _historyVersion;
+
+        private class MovedMarker
+        {
+            public ulong OwnerId;
+            public Vector3 Position;
+        }
 
         private class PendingDrop
         {
@@ -50,6 +70,16 @@ namespace Oxide.Plugins
             public ulong OwnerId;
             public SupplySignal Signal;
             public int AnimalsInFlight;
+            public int Id;
+            public bool IsTest;
+            public int SpawnedCount;
+            public int LandedCount;
+            public bool AnyLanded => LandedCount > 0;
+            public bool Recorded;
+            public Vector3 LastPosition;
+            public bool MovedToGround;
+            public bool NoWalkableGround;
+            public bool CountedForWipe;
         }
 
         #endregion
@@ -179,6 +209,9 @@ namespace Oxide.Plugins
             [JsonProperty("Thrower Can Lead Animal Immediately")]
             public bool TrustThrower = true;
 
+            [JsonProperty("Thrower Owns Animal")]
+            public bool ThrowerOwnsAnimal = true;
+
             // Vanilla smokes for 210 s after the signal pops; this ends it once the last animal is down.
             [JsonProperty("Stop Signal Smoke After Landing (Seconds, -1 = vanilla)")]
             public float StopSmokeAfterLanding = 10f;
@@ -211,6 +244,9 @@ namespace Oxide.Plugins
 
             [JsonProperty("Balloon Text")]
             public string BalloonText = "";
+
+            [JsonProperty("Limit Per Player Per Wipe (0 = no limit)")]
+            public int WipeLimit = 0;
         }
 
         protected override void LoadDefaultConfig() => _config = PluginConfig.CreateDefault();
@@ -256,7 +292,12 @@ namespace Oxide.Plugins
                 ["AnimalNotFound"] = "No animal named '{0}'. Animals: {1}",
                 ["ItemFailed"] = "Failed to create the supply signal item.",
                 ["Given"] = "Gave '{0}' signal to {1}.",
-                ["Received"] = "You received a '{0}' signal. Throw it to call in a livestock drop!"
+                ["Received"] = "You received a '{0}' signal. Throw it to call in a livestock drop!",
+                ["Refunded"] = "Your '{0}' drop failed, so the signal has been returned to you.",
+                ["RefundedDeploymentError"] = "An error occurred in the deployment of your livestock signal and your signal has been returned. Any signal cooldown you have still applies.",
+                ["MovedToGround"] = "Your '{0}' couldn't land where it was dropped, so it was moved to the nearest walkable ground. Look for the {1} marker on your map.",
+                ["WipeLimitReached"] = "You have used all {1} '{0}' drops allowed per player this wipe. Your signal has been returned.",
+                ["RefundInventoryFull"] = "A failed livestock drop is waiting to be returned to you. Make space in your inventory to receive the signal."
             }, this);
         }
 
@@ -274,6 +315,15 @@ namespace Oxide.Plugins
         {
             _instance = this;
             permission.RegisterPermission(PermAdmin, this);
+            LoadRefunds();
+            LoadHistory();
+            LoadWipeUses();
+        }
+
+        private void OnNewSave(string filename)
+        {
+            _wipeUses.Clear();
+            SaveWipeUses();
         }
 
         private void OnServerInitialized()
@@ -295,14 +345,30 @@ namespace Oxide.Plugins
 
             foreach (var duplicate in _config.Airdrops.GroupBy(a => a.SkinId).Where(g => g.Count() > 1))
                 PrintWarning($"Skin ID {duplicate.Key} is used by multiple animals; only '{duplicate.First().Name}' will be used.");
+
+            DeliverAllRefunds();
+            timer.Every(RefundRetrySeconds, DeliverAllRefunds);
+            timer.Every(AdminPanelRefreshSeconds, RefreshAdminPanels);
         }
 
         private void Unload()
         {
-            foreach (CargoPlane plane in _planes.Keys.ToList())
+            foreach (KeyValuePair<CargoPlane, PendingDrop> entry in _planes)
             {
-                if (plane != null && !plane.IsDestroyed)
-                    plane.Kill();
+                if (entry.Key != null && !entry.Key.IsDestroyed)
+                    entry.Key.Kill();
+
+                QueueRefund(entry.Value, "the plugin unloaded while the plane was flying");
+            }
+
+            // A signal still counting down would otherwise call an ordinary supply drop once the plugin is gone.
+            foreach (KeyValuePair<BaseEntity, PendingDrop> entry in _armedSignals)
+            {
+                if (entry.Key == null || entry.Key.IsDestroyed)
+                    continue;
+
+                entry.Key.Kill();
+                QueueRefund(entry.Value, "the plugin unloaded before the plane was called");
             }
 
             foreach (DescentController descent in _descents.ToList())
@@ -311,9 +377,17 @@ namespace Oxide.Plugins
                     descent.ForceLand();
             }
 
+            foreach (MovedMarker marker in _movedMarkers.ToList())
+                RemoveMovedMarker(marker);
+
+            foreach (BasePlayer player in BasePlayer.activePlayerList)
+                CuiHelper.DestroyUi(player, UiRoot);
+
             BalloonRelease.KillAll();
             _instance = null;
         }
+
+        private void OnPlayerDisconnected(BasePlayer player) => _adminPanels.Remove(player.userID);
 
         private void OnExplosiveThrown(BasePlayer player, BaseEntity entity, ThrownWeapon weapon) => ArmSignal(player, entity, weapon);
 
@@ -327,6 +401,8 @@ namespace Oxide.Plugins
 
             _armedSignals.Remove(signal);
             pending.Signal = signal;
+            pending.LastPosition = plane.dropPosition;
+            CountWipeUse(pending);
             PurgeDeadPlanes();
             ConfigurePlane(plane);
             _planes[plane] = pending;
@@ -337,8 +413,15 @@ namespace Oxide.Plugins
 
             timer.Once(plane.secondsToTake + PlaneStuckGraceSeconds, () =>
             {
-                if (_planes.Remove(plane) && plane != null && !plane.IsDestroyed)
+                PendingDrop undelivered;
+                if (!_planes.TryGetValue(plane, out undelivered))
+                    return;
+
+                _planes.Remove(plane);
+                if (plane != null && !plane.IsDestroyed)
                     plane.Kill();
+
+                RefundDrop(undelivered, "the plane never dropped its cargo");
             });
         }
 
@@ -426,7 +509,14 @@ namespace Oxide.Plugins
             }
 
             PurgeDeadSignals();
-            _armedSignals[entity] = new PendingDrop { Animal = animal, OwnerId = player.userID };
+            if (WipeLimitReached(player.userID, animal))
+            {
+                // Next tick so a cooldown plugin has run first: if it refunded this throw, ours would be a duplicate.
+                NextTick(() => RejectOverLimitSignal(player, entity, animal));
+                return;
+            }
+
+            _armedSignals[entity] = new PendingDrop { Animal = animal, OwnerId = player.userID, Id = ++_nextDropId, LastPosition = entity.transform.position };
         }
 
         // The refund is the newest plain supply signal in the inventory (signals don't stack, item uids only grow).
@@ -468,6 +558,7 @@ namespace Oxide.Plugins
         private void SpawnHerd(Vector3 position, PendingDrop pending)
         {
             AnimalConfig animal = pending.Animal;
+            pending.LastPosition = position;
             int count = Mathf.Clamp(animal.SpawnCount, 1, 10);
             for (int i = 0; i < count; i++)
             {
@@ -479,11 +570,18 @@ namespace Oxide.Plugins
                 }
 
                 if (SpawnAirdropAnimal(position + offset, pending) != null)
+                {
                     pending.AnimalsInFlight++;
+                    pending.SpawnedCount++;
+                }
             }
 
             if (pending.AnimalsInFlight == 0)
+            {
+                RecordDrop(pending, ResultFailed, "Could not be spawned. Signal returned.");
+                RefundDrop(pending, "the animal could not be spawned");
                 ScheduleSmokeStop(pending);
+            }
         }
 
         private BaseEntity SpawnAirdropAnimal(Vector3 position, PendingDrop pending)
@@ -515,8 +613,14 @@ namespace Oxide.Plugins
 
             animal.Spawn();
 
-            if (livestock != null && ownerId != 0 && _config.General.TrustThrower)
-                livestock.SetFamiliarity(ownerId, ConVar.Livestock.trustToLead);
+            if (livestock != null && ownerId != 0)
+            {
+                // The same calls LivestockVendor makes for a bought animal.
+                if (_config.General.ThrowerOwnsAnimal)
+                    livestock.SetOwner(ownerId, LivestockAnimal.OwnerChangeReason.Purchased);
+                if (_config.General.TrustThrower)
+                    livestock.SetFamiliarity(ownerId, ConVar.Livestock.trustToLead);
+            }
 
             GeneralSettings settings = _config.General;
             DescentController descent = animal.gameObject.AddComponent<DescentController>();
@@ -531,6 +635,9 @@ namespace Oxide.Plugins
 
         private void OnAnimalLanded(BaseEntity animal, PendingDrop pending)
         {
+            if (pending != null)
+                pending.LandedCount++;
+
             OnAnimalDelivered(pending);
             if (_protectedAnimals.Contains(animal))
                 timer.Once(LandingGraceSeconds, () => _protectedAnimals.Remove(animal));
@@ -549,7 +656,60 @@ namespace Oxide.Plugins
 
             pending.AnimalsInFlight--;
             if (pending.AnimalsInFlight <= 0)
+            {
+                RecordFinishedDrop(pending);
                 ScheduleSmokeStop(pending);
+            }
+        }
+
+        // A personal map note, so only the owner sees it. The game caps its own label length at 10 characters.
+        private void AddMovedMarker(PendingDrop pending, Vector3 position)
+        {
+            BasePlayer owner = BasePlayer.FindAwakeOrSleepingByID(pending.OwnerId);
+            if (owner == null)
+                return;
+
+            if (owner.State.pointsOfInterest == null)
+                owner.State.pointsOfInterest = Facepunch.Pool.Get<List<ProtoBuf.MapNote>>();
+
+            ProtoBuf.MapNote note = Facepunch.Pool.Get<ProtoBuf.MapNote>();
+            note.noteType = (int)BasePlayer.MapNoteType.PointOfInterest;
+            note.worldPosition = position;
+            note.label = MovedMarkerLabel;
+            owner.State.pointsOfInterest.Add(note);
+            RefreshMapNotes(owner);
+
+            MovedMarker marker = new MovedMarker { OwnerId = pending.OwnerId, Position = position };
+            _movedMarkers.Add(marker);
+            timer.Once(MovedMarkerSeconds, () => RemoveMovedMarker(marker));
+
+            if (owner.IsConnected)
+                owner.ChatMessage(Msg("MovedToGround", owner.UserIDString, pending.Animal.Name, MovedMarkerLabel));
+        }
+
+        // Matched by label and position because the player may have deleted it, and deleted notes are recycled.
+        private void RemoveMovedMarker(MovedMarker marker)
+        {
+            _movedMarkers.Remove(marker);
+            BasePlayer owner = BasePlayer.FindAwakeOrSleepingByID(marker.OwnerId);
+            List<ProtoBuf.MapNote> notes = owner != null ? owner.State.pointsOfInterest : null;
+            if (notes == null)
+                return;
+
+            int index = notes.FindIndex(n => n.label == MovedMarkerLabel && n.worldPosition == marker.Position);
+            if (index < 0)
+                return;
+
+            notes[index].Dispose();
+            notes.RemoveAt(index);
+            RefreshMapNotes(owner);
+        }
+
+        private static void RefreshMapNotes(BasePlayer player)
+        {
+            player.DirtyPlayerState();
+            if (player.IsConnected)
+                player.SendMarkersToClient();
         }
 
         private void ScheduleSmokeStop(PendingDrop pending)
@@ -560,11 +720,307 @@ namespace Oxide.Plugins
                 return;
 
             pending.Signal = null;
-            timer.Once(Mathf.Max(0f, delay), () =>
+            float wait = Mathf.Max(0f, delay);
+            SmokeStop smokeStop = new SmokeStop { Drop = pending, Position = signal.transform.position, EndsAt = Time.realtimeSinceStartup + wait };
+            _smokeStops.Add(smokeStop);
+            timer.Once(wait, () =>
             {
+                _smokeStops.Remove(smokeStop);
                 if (signal != null && !signal.IsDestroyed)
                     signal.FinishUp();
             });
+        }
+
+        #endregion
+
+        #region Wipe Limits
+
+        private const string WipeUsesDataFile = "LivestockAirdrops_WipeUses";
+        private const int MaxWipeLimit = 99;
+
+        private void LoadWipeUses()
+        {
+            try
+            {
+                _wipeUses = Oxide.Core.Interface.Oxide.DataFileSystem.ReadObject<Dictionary<ulong, Dictionary<ulong, int>>>(WipeUsesDataFile)
+                    ?? new Dictionary<ulong, Dictionary<ulong, int>>();
+            }
+            catch (JsonException)
+            {
+                PrintError($"Could not read oxide/data/{WipeUsesDataFile}.json, so per-wipe counts start from zero.");
+                _wipeUses = new Dictionary<ulong, Dictionary<ulong, int>>();
+            }
+        }
+
+        private void SaveWipeUses() => Oxide.Core.Interface.Oxide.DataFileSystem.WriteObject(WipeUsesDataFile, _wipeUses);
+
+        private int WipeUsesOf(ulong playerId, ulong skin)
+        {
+            Dictionary<ulong, int> uses;
+            int count;
+            return _wipeUses.TryGetValue(playerId, out uses) && uses.TryGetValue(skin, out count) ? count : 0;
+        }
+
+        // Signals still counting down are included, or a player could throw several before the first one counts.
+        private bool WipeLimitReached(ulong playerId, AnimalConfig animal)
+        {
+            if (animal.WipeLimit <= 0)
+                return false;
+
+            int waiting = _armedSignals.Values.Count(p => p.OwnerId == playerId && p.Animal == animal);
+            return WipeUsesOf(playerId, animal.SkinId) + waiting >= animal.WipeLimit;
+        }
+
+        private void RejectOverLimitSignal(BasePlayer player, BaseEntity entity, AnimalConfig animal)
+        {
+            if (entity == null || entity.IsDestroyed)
+                return;
+
+            entity.Kill();
+            if (player == null)
+                return;
+
+            Item item = ItemManager.CreateByName(SupplySignalShortname, 1, animal.SkinId);
+            if (item != null)
+            {
+                item.name = animal.Name;
+                player.GiveItem(item);
+            }
+
+            player.ChatMessage(Msg("WipeLimitReached", player.UserIDString, animal.Name, animal.WipeLimit));
+        }
+
+        // Counted once the plane is called: a cooldown plugin can still cancel the throw before that.
+        private void CountWipeUse(PendingDrop pending)
+        {
+            Dictionary<ulong, int> uses;
+            if (!_wipeUses.TryGetValue(pending.OwnerId, out uses))
+                _wipeUses[pending.OwnerId] = uses = new Dictionary<ulong, int>();
+
+            uses[pending.Animal.SkinId] = WipeUsesOf(pending.OwnerId, pending.Animal.SkinId) + 1;
+            pending.CountedForWipe = true;
+            SaveWipeUses();
+        }
+
+        private void ReleaseWipeUse(PendingDrop pending)
+        {
+            if (!pending.CountedForWipe)
+                return;
+
+            pending.CountedForWipe = false;
+            int remaining = WipeUsesOf(pending.OwnerId, pending.Animal.SkinId) - 1;
+            Dictionary<ulong, int> uses;
+            if (!_wipeUses.TryGetValue(pending.OwnerId, out uses))
+                return;
+
+            if (remaining > 0)
+                uses[pending.Animal.SkinId] = remaining;
+            else
+                uses.Remove(pending.Animal.SkinId);
+
+            SaveWipeUses();
+        }
+
+        #endregion
+
+        #region Drop History
+
+        private const string HistoryDataFile = "LivestockAirdrops_History";
+        private const int MaxHistoryEntries = 200;
+        private const string ResultLanded = "LANDED";
+        private const string ResultLost = "LOST";
+        private const string ResultFailed = "FAILED";
+        private const string ResultRefunded = "REFUNDED";
+        private const string ResultCancelled = "CANCELLED";
+
+        private class DropRecord
+        {
+            public System.DateTime Time;
+            public string Animal;
+            public ulong SkinId;
+            public ulong OwnerId;
+            public string OwnerName;
+            public string Grid;
+            public string Result;
+            public string Detail;
+        }
+
+        private void LoadHistory()
+        {
+            try
+            {
+                _history = Oxide.Core.Interface.Oxide.DataFileSystem.ReadObject<List<DropRecord>>(HistoryDataFile) ?? new List<DropRecord>();
+            }
+            catch (JsonException)
+            {
+                PrintError($"Could not read oxide/data/{HistoryDataFile}.json, so drop history starts empty.");
+                _history = new List<DropRecord>();
+            }
+        }
+
+        private void RecordFinishedDrop(PendingDrop pending)
+        {
+            // Already recorded means already settled: a cancelled drop was refunded before its animals were removed.
+            if (pending.Recorded)
+                return;
+
+            if (pending.AnyLanded)
+            {
+                string landed = pending.SpawnedCount > 1 ? $"{pending.LandedCount} of {pending.SpawnedCount} landed. " : "";
+                RecordDrop(pending, ResultLanded, landed + (pending.MovedToGround ? "Moved to walkable ground." : ""));
+                return;
+            }
+
+            RecordDrop(pending, ResultLost, (pending.NoWalkableGround ? "No walkable ground nearby." : "Destroyed before landing.") + " Signal returned.");
+            RefundDrop(pending, pending.NoWalkableGround ? "there was no walkable ground nearby" : "the animal was destroyed before landing");
+        }
+
+        // Saved on every entry, as drops are infrequent and the last ones matter most after a crash.
+        // Each drop is recorded once: a cancelled drop's animals also report back as lost.
+        private void RecordDrop(PendingDrop pending, string result, string detail)
+        {
+            if (pending == null || pending.IsTest || pending.Recorded)
+                return;
+
+            pending.Recorded = true;
+            _history.Add(new DropRecord
+            {
+                Time = System.DateTime.Now,
+                Animal = pending.Animal.Name,
+                SkinId = pending.Animal.SkinId,
+                OwnerId = pending.OwnerId,
+                OwnerName = DropOwnerName(pending),
+                Grid = MapHelper.PositionToString(pending.LastPosition),
+                Result = result,
+                Detail = detail
+            });
+
+            if (_history.Count > MaxHistoryEntries)
+                _history.RemoveAt(0);
+
+            _historyVersion++;
+            Oxide.Core.Interface.Oxide.DataFileSystem.WriteObject(HistoryDataFile, _history);
+        }
+
+        #endregion
+
+        #region Refunds
+
+        private const string RefundDataFile = "LivestockAirdrops_Refunds";
+        private const float RefundRetrySeconds = 30f;
+
+        private class RefundEntry
+        {
+            public ulong Skin;
+            public bool CancelledByAdmin;
+        }
+
+        private void LoadRefunds()
+        {
+            try
+            {
+                _refunds = Oxide.Core.Interface.Oxide.DataFileSystem.ReadObject<Dictionary<ulong, List<RefundEntry>>>(RefundDataFile)
+                    ?? new Dictionary<ulong, List<RefundEntry>>();
+            }
+            catch (JsonException)
+            {
+                PrintError($"Could not read oxide/data/{RefundDataFile}.json, so any refunds in it will not be delivered.");
+                _refunds = new Dictionary<ulong, List<RefundEntry>>();
+            }
+        }
+
+        private void SaveRefunds() => Oxide.Core.Interface.Oxide.DataFileSystem.WriteObject(RefundDataFile, _refunds);
+
+        private void RefundDrop(PendingDrop pending, string reason, bool cancelledByAdmin = false)
+        {
+            QueueRefund(pending, reason, cancelledByAdmin);
+            if (pending != null)
+                DeliverRefunds(BasePlayer.FindByID(pending.OwnerId));
+        }
+
+        // Saves straight away. Unload relies on this alone, because a shutdown may already be past its inventory save.
+        private void QueueRefund(PendingDrop pending, string reason, bool cancelledByAdmin = false)
+        {
+            if (pending == null || pending.OwnerId == 0 || pending.IsTest)
+                return;
+
+            RecordDrop(pending, cancelledByAdmin ? ResultCancelled : ResultRefunded, char.ToUpperInvariant(reason[0]) + reason.Substring(1));
+            ReleaseWipeUse(pending);
+
+            List<RefundEntry> entries;
+            if (!_refunds.TryGetValue(pending.OwnerId, out entries))
+                _refunds[pending.OwnerId] = entries = new List<RefundEntry>();
+
+            entries.Add(new RefundEntry { Skin = pending.Animal.SkinId, CancelledByAdmin = cancelledByAdmin });
+            SaveRefunds();
+
+            // The drop is over, so the thrown signal shouldn't keep marking the spot.
+            SupplySignal signal = pending.Signal;
+            pending.Signal = null;
+            if (signal != null && !signal.IsDestroyed)
+                signal.FinishUp();
+
+            Puts($"Refund queued for {pending.OwnerId}: '{pending.Animal.Name}' signal, because {reason}.");
+        }
+
+        private void DeliverAllRefunds()
+        {
+            foreach (ulong ownerId in _refunds.Keys.ToList())
+                DeliverRefunds(BasePlayer.FindByID(ownerId));
+        }
+
+        private void DeliverRefunds(BasePlayer player)
+        {
+            List<RefundEntry> entries;
+            if (player == null || !player.IsConnected || player.IsDead() || player.IsSleeping() || !_refunds.TryGetValue(player.userID, out entries))
+                return;
+
+            List<RefundEntry> undelivered = new List<RefundEntry>();
+            bool inventoryFull = false;
+            foreach (RefundEntry entry in entries)
+            {
+                AnimalConfig animal = FindAnimalBySkin(entry.Skin);
+                Item item = animal != null ? ItemManager.CreateByName(SupplySignalShortname, 1, entry.Skin) : null;
+                if (item == null)
+                {
+                    WarnOnce($"A refund for signal skin {entry.Skin} can't be delivered: no animal in the config uses that skin.");
+                    undelivered.Add(entry);
+                    continue;
+                }
+
+                // Not BasePlayer.GiveItem: with a full inventory that drops the signal on the ground.
+                item.name = animal.Name;
+                if (!player.inventory.GiveItem(item))
+                {
+                    item.Remove();
+                    undelivered.Add(entry);
+                    inventoryFull = true;
+                    continue;
+                }
+
+                player.ChatMessage(Msg(entry.CancelledByAdmin ? "RefundedDeploymentError" : "Refunded", player.UserIDString, animal.Name));
+                Puts($"Refund delivered to {player.displayName} [{player.UserIDString}]: '{animal.Name}' signal.");
+            }
+
+            if (inventoryFull)
+            {
+                if (_refundFullWarned.Add(player.userID))
+                    player.ChatMessage(Msg("RefundInventoryFull", player.UserIDString));
+            }
+            else
+            {
+                _refundFullWarned.Remove(player.userID);
+            }
+
+            if (undelivered.Count == entries.Count)
+                return;
+
+            if (undelivered.Count == 0)
+                _refunds.Remove(player.userID);
+            else
+                _refunds[player.userID] = undelivered;
+
+            SaveRefunds();
         }
 
         #endregion
@@ -575,7 +1031,11 @@ namespace Oxide.Plugins
         {
             private static readonly int GroundMask = LayerMask.GetMask("Terrain", "World", "Construction", "Deployed");
 
-            private const float Gen2NavmeshSampleRadius = 10f;
+            private const float WalkableSampleRadius = 10f;
+            private const int SearchDirections = 8;
+            private const float MaxWadingDepth = 0.5f;
+            private const float MovedReportDistance = 5f;
+            private static readonly float[] SearchRingDistances = { 15f, 30f, 50f };
 
             private readonly List<Behaviour> _suspended = new List<Behaviour>();
             private BaseEntity _animal;
@@ -631,12 +1091,6 @@ namespace Oxide.Plugins
 
             private void ResumeGen2AI(Vector3 groundPosition)
             {
-                Vector3 onNavmesh;
-                if (_npc.TrySampleNavmesh(groundPosition, Gen2NavmeshSampleRadius, out onNavmesh))
-                    groundPosition = onNavmesh;
-                else
-                    _instance?.PrintWarning($"{_npc.ShortPrefabName} landed off the navmesh at {groundPosition}; it may not be able to move.");
-
                 _npc.transform.position = groundPosition;
 
                 // Unpause re-warps the agent onto the navmesh at the current transform position.
@@ -786,6 +1240,31 @@ namespace Oxide.Plugins
                 _animal.SendNetworkUpdate_Position();
             }
 
+            public PendingDrop Drop => _drop;
+            public bool InFlight => !_finished && _animal != null && !_animal.IsDestroyed;
+            public int BalloonsLeft => _balloons.Count(b => b != null && !b.IsDestroyed);
+            public Vector3 GroundBelow
+            {
+                get
+                {
+                    Vector3 position = _animal.transform.position;
+                    return new Vector3(position.x, GetGroundHeight(position), position.z);
+                }
+            }
+            public float HeightAboveGround => _animal.transform.position.y - GroundBelow.y;
+
+            // Balloons are released first so they float away instead of vanishing with the animal.
+            public void Cancel()
+            {
+                if (_finished)
+                    return;
+
+                BaseEntity animal = _animal;
+                Abort();
+                if (animal != null && !animal.IsDestroyed)
+                    animal.Kill();
+            }
+
             public void ForceLand()
             {
                 if (_finished || _animal == null || _animal.IsDestroyed)
@@ -798,8 +1277,59 @@ namespace Oxide.Plugins
                 Land(new Vector3(position.x, GetGroundHeight(position), position.z));
             }
 
+            private bool TryFindWalkableGround(ref Vector3 groundPosition)
+            {
+                Vector3 walkable;
+                if (!TrySampleDryGround(groundPosition, out walkable) && !TrySearchRings(groundPosition, out walkable))
+                    return false;
+
+                if (Vector3.Distance(groundPosition, walkable) >= MovedReportDistance && !_drop.MovedToGround)
+                {
+                    _drop.MovedToGround = true;
+                    _instance?.AddMovedMarker(_drop, walkable);
+                }
+
+                groundPosition = walkable;
+                return true;
+            }
+
+            // The seabed counts as navmesh, so anything deeper than wading depth is rejected.
+            private bool TrySampleDryGround(Vector3 position, out Vector3 walkable)
+            {
+                return _npc.TrySampleNavmesh(position, WalkableSampleRadius, out walkable)
+                    && WaterLevel.GetWaterDepth(walkable, false, false) <= MaxWadingDepth;
+            }
+
+            // A single wide sample returns the closest navmesh, which offshore is always seabed, so sample around
+            // the landing spot instead. Closest ring first: the animal only moves as far as it has to.
+            private bool TrySearchRings(Vector3 centre, out Vector3 walkable)
+            {
+                foreach (float distance in SearchRingDistances)
+                {
+                    for (int i = 0; i < SearchDirections; i++)
+                    {
+                        Vector3 point = centre + Quaternion.Euler(0f, 360f * i / SearchDirections, 0f) * Vector3.forward * distance;
+                        point.y = TerrainMeta.HeightMap.GetHeight(point);
+                        if (TrySampleDryGround(point, out walkable))
+                            return true;
+                    }
+                }
+
+                walkable = default(Vector3);
+                return false;
+            }
+
             private void Land(Vector3 groundPosition)
             {
+                // Without an agent there is nothing to check against, so it lands where it is.
+                if (_npc != null && _agent != null && !TryFindWalkableGround(ref groundPosition))
+                {
+                    _instance?.PrintWarning($"{_npc.ShortPrefabName} had no walkable ground near {groundPosition}; removing it.");
+                    _drop.NoWalkableGround = true;
+                    Cancel();
+                    return;
+                }
+
                 _finished = true;
                 ReleaseBalloons();
 
@@ -1049,6 +1579,1107 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Admin Panel
+
+        private const string UiRoot = "LivestockAirdrops.Root";
+        private const string UiBody = "LivestockAirdrops.Body";
+        private const string UiCommand = "livestockairdrops.ui";
+        private const string UiBold = "robotocondensed-bold.ttf";
+        private const string UiRegular = "robotocondensed-regular.ttf";
+        private const string UiDefaultStatus = "Saved changes apply to the next drop.";
+        private const string TabAnimals = "animals";
+        private const string TabSettings = "settings";
+        private const string TabActive = "active";
+        private const string TabHistory = "history";
+        private const string UiHistoryStatus = "Most recent first. Test drops are not recorded.";
+        private const int HistoryRowsPerPage = 10;
+        private const string UiActiveStatus = "Updates live while this panel is open.";
+        private const string UiActiveTabLabel = "LivestockAirdrops.ActiveTab";
+        private const int ActiveDropsPerPage = 5;
+        private const float AdminPanelRefreshSeconds = 1f;
+        private const int MaxDisplayedNameLength = 20;
+        private const int PanelWidth = 1000;
+        private const int PanelHeight = 580;
+        private const int FooterTop = 520;
+        private const int MaxAnimalsWithoutPaging = 6;
+        private const int AnimalsPerPage = 5;
+        private const int MaxSpawnCount = 10;
+        private const float TestDropForwardDistance = 12f;
+
+        private static class UiColor
+        {
+            public static readonly string Backdrop = "0 0 0 0.6";
+            public static readonly string Panel = Hex("26271f");
+            public static readonly string Bar = Hex("1d1e18");
+            public static readonly string Inset = Hex("1f2019");
+            public static readonly string Field = Hex("17180f");
+            public static readonly string Row = Hex("2a2b23");
+            public static readonly string RowSelected = Hex("4f5043");
+            public static readonly string Tab = Hex("33342b");
+            public static readonly string TabSelected = Hex("a8361f");
+            public static readonly string Neutral = Hex("45463a");
+            public static readonly string Green = Hex("4f6b24");
+            public static readonly string Blue = Hex("2f6f9f");
+            public static readonly string Red = Hex("9f3220");
+            public static readonly string Amber = Hex("d9a441");
+            public static readonly string Text = Hex("e8e2d6");
+            public static readonly string Muted = Hex("c4beae");
+            public static readonly string OnGreen = Hex("f0f6df");
+            public static readonly string White = "1 1 1 1";
+            public static readonly string ErrorText = Hex("ff9b85");
+            public static readonly string Clear = "0 0 0 0";
+
+            private static string Hex(string hex)
+            {
+                int value = System.Convert.ToInt32(hex, 16);
+                return string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:0.###} {1:0.###} {2:0.###} 1",
+                    ((value >> 16) & 255) / 255f, ((value >> 8) & 255) / 255f, (value & 255) / 255f);
+            }
+        }
+
+        private class AdminPanelState
+        {
+            public PluginConfig Draft;
+            public string Tab = TabAnimals;
+            public int AnimalIndex;
+            public string GiveTarget = "";
+            public string Status;
+            public bool StatusIsError;
+            public int ActivePage;
+            public string ActiveSignature;
+            public int ShownActiveCount;
+            public int HistoryPage;
+            public int ShownHistoryVersion;
+        }
+
+        private class SmokeStop
+        {
+            public PendingDrop Drop;
+            public Vector3 Position;
+            public float EndsAt;
+        }
+
+        private class ActiveDrop
+        {
+            public PendingDrop Drop;
+            public string Status;
+            public string StatusColor;
+            public string StatusTextColor;
+            public string Detail;
+            public string Height;
+            public Vector3 Position;
+            public bool CanLand;
+            public bool CanCancel;
+        }
+
+        private class UiSetting
+        {
+            public string Key;
+            public string Label;
+            public System.Func<GeneralSettings, bool> GetToggle;
+            public System.Action<GeneralSettings, bool> SetToggle;
+            public System.Func<GeneralSettings, float> GetNumber;
+            public System.Action<GeneralSettings, float> SetNumber;
+            public float Increment;
+            public float Min;
+            public float Max;
+            public string Format = "0";
+
+            public bool IsToggle => GetToggle != null;
+
+            // Values hand-set outside the range are left alone until stepped back towards it, so a click never jumps them.
+            public void Step(GeneralSettings settings, int direction)
+            {
+                float value = GetNumber(settings);
+                float next = direction > 0
+                    ? (value >= Max ? value : Mathf.Min(value + Increment, Max))
+                    : (value <= Min ? value : Mathf.Max(value - Increment, Min));
+                SetNumber(settings, Mathf.Round(next * 100f) / 100f);
+            }
+        }
+
+        private class UiSettingGroup
+        {
+            public string Title;
+            public UiSetting[] Settings;
+        }
+
+        private static UiSetting Toggle(string key, string label, System.Func<GeneralSettings, bool> get, System.Action<GeneralSettings, bool> set)
+        {
+            return new UiSetting { Key = key, Label = label, GetToggle = get, SetToggle = set };
+        }
+
+        private static UiSetting Number(string key, string label, System.Func<GeneralSettings, float> get, System.Action<GeneralSettings, float> set, float increment, float min, float max, string format = "0")
+        {
+            return new UiSetting { Key = key, Label = label, GetNumber = get, SetNumber = set, Increment = increment, Min = min, Max = max, Format = format };
+        }
+
+        // Limits match the clamps the drop code applies.
+        private static readonly UiSettingGroup[] LeftSettingGroups =
+        {
+            new UiSettingGroup { Title = "PLANE", Settings = new[]
+            {
+                Number("altitude", "Drop altitude (metres)", s => s.DropAltitude, (s, v) => s.DropAltitude = v, 10f, 50f, 500f),
+                Number("planespeed", "Flight speed", s => s.PlaneSpeed, (s, v) => s.PlaneSpeed = v, 5f, 10f, 150f)
+            } },
+            new UiSettingGroup { Title = "DESCENT", Settings = new[]
+            {
+                Number("descent", "Descent speed modifier", s => s.DescentSpeedModifier, (s, v) => s.DescentSpeedModifier = v, 0.1f, 0.1f, 5f, "0.0"),
+                Toggle("protect", "Prevent landing damage", s => s.PreventLandingDamage, (s, v) => s.PreventLandingDamage = v),
+                Toggle("popped", "Popped balloons speed up descent", s => s.PoppedBalloonsSpeedUp, (s, v) => s.PoppedBalloonsSpeedUp = v)
+            } }
+        };
+
+        private static readonly UiSettingGroup[] RightSettingGroups =
+        {
+            new UiSettingGroup { Title = "BALLOONS", Settings = new[]
+            {
+                Toggle("balloons", "Use party balloons", s => s.UseBalloons, (s, v) => s.UseBalloons = v),
+                Number("balloons.count", "Balloon count", s => s.BalloonCount, (s, v) => s.BalloonCount = Mathf.RoundToInt(v), 1f, 1f, 16f),
+                Number("balloons.scale", "Balloon scale", s => s.BalloonScale, (s, v) => s.BalloonScale = v, 0.5f, 0.5f, 5f, "0.0"),
+                Number("balloons.bubble", "Speech bubble scale", s => s.SpeechBubbleScale, (s, v) => s.SpeechBubbleScale = v, 0.5f, 0.5f, 6f, "0.0"),
+                Number("balloons.height", "Height above animal", s => s.BalloonHeight, (s, v) => s.BalloonHeight = v, 0.1f, 0f, 5f, "0.0")
+            } },
+            new UiSettingGroup { Title = "AFTER LANDING", Settings = new[]
+            {
+                Toggle("lead", "Thrower can lead animal immediately", s => s.TrustThrower, (s, v) => s.TrustThrower = v),
+                Toggle("owner", "Thrower owns the animal", s => s.ThrowerOwnsAnimal, (s, v) => s.ThrowerOwnsAnimal = v),
+                Number("smoke", "Stop smoke after (seconds, -1 = vanilla)", s => s.StopSmokeAfterLanding, (s, v) => s.StopSmokeAfterLanding = v, 5f, -1f, 210f)
+            } }
+        };
+
+        private static UiSetting FindSetting(string key)
+        {
+            return LeftSettingGroups.Concat(RightSettingGroups).SelectMany(g => g.Settings).FirstOrDefault(s => s.Key == key);
+        }
+
+        [ChatCommand("livestockadmin")]
+        private void ChatLivestockAdmin(BasePlayer player, string command, string[] args)
+        {
+            if (!permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                player.ChatMessage(Msg("NoPermission", player.UserIDString));
+                return;
+            }
+
+            OpenAdminPanel(player);
+        }
+
+        [ConsoleCommand(UiCommand)]
+        private void ConsoleAdminUi(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null)
+                return;
+
+            AdminPanelState state;
+            if (!_adminPanels.TryGetValue(player.userID, out state))
+                return;
+
+            if (!permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                CloseAdminPanel(player);
+                return;
+            }
+
+            string[] args = arg.Args?.Select(a => a.ToString()).ToArray() ?? new string[0];
+            string action = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+            if (action == "close")
+            {
+                CloseAdminPanel(player);
+                return;
+            }
+
+            // Typed text is stored without redrawing: it arrives as the admin clicks away, and a redraw
+            // at that moment could replace the button they are in the middle of clicking.
+            if (action == "text" || action == "target")
+            {
+                StoreAdminText(state, args, action);
+                return;
+            }
+
+            state.Status = null;
+            state.StatusIsError = false;
+            RunAdminAction(player, state, action, args);
+
+            // Teleporting closes the panel.
+            if (_adminPanels.ContainsKey(player.userID))
+                DrawAdminPanel(player, state);
+        }
+
+        private static void StoreAdminText(AdminPanelState state, string[] args, string action)
+        {
+            if (action == "target")
+            {
+                state.GiveTarget = string.Join(" ", args.Skip(1)).Trim();
+                return;
+            }
+
+            AnimalConfig animal = SelectedAnimal(state);
+            if (animal == null || args.Length < 2)
+                return;
+
+            string value = string.Join(" ", args.Skip(2)).Trim();
+            switch (args[1])
+            {
+                case "balloon": animal.BalloonText = value; break;
+                case "note": animal.Notification = value; break;
+            }
+        }
+
+        private void RunAdminAction(BasePlayer player, AdminPanelState state, string action, string[] args)
+        {
+            string value = args.Length > 1 ? args[1] : "";
+            int number;
+            int.TryParse(value, out number);
+            AnimalConfig animal = SelectedAnimal(state);
+
+            switch (action)
+            {
+                case "tab":
+                    state.Tab = value == TabSettings || value == TabActive || value == TabHistory ? value : TabAnimals;
+                    break;
+
+                case "historypage":
+                    state.HistoryPage += System.Math.Sign(number);
+                    break;
+
+                case "activepage":
+                    state.ActivePage += System.Math.Sign(number);
+                    break;
+
+                case "drop":
+                    RunDropAction(player, state, value, args);
+                    break;
+
+                case "animal":
+                    state.AnimalIndex = Mathf.Clamp(number, 0, Mathf.Max(0, state.Draft.Airdrops.Count - 1));
+                    break;
+
+                case "sex":
+                    if (animal != null && !SexIsFixed(animal) && (value == "Random" || value == "Male" || value == "Female"))
+                        animal.Sex = value;
+                    break;
+
+                case "spawn":
+                    if (animal != null)
+                        animal.SpawnCount = Mathf.Clamp(animal.SpawnCount + System.Math.Sign(number), 1, MaxSpawnCount);
+                    break;
+
+                case "wipelimit":
+                    if (animal != null)
+                        animal.WipeLimit = Mathf.Clamp(animal.WipeLimit + System.Math.Sign(number), 0, MaxWipeLimit);
+                    break;
+
+                case "step":
+                {
+                    UiSetting setting = FindSetting(value);
+                    int direction;
+                    if (setting != null && !setting.IsToggle && args.Length > 2 && int.TryParse(args[2], out direction))
+                        setting.Step(state.Draft.General, System.Math.Sign(direction));
+                    break;
+                }
+
+                case "toggle":
+                {
+                    UiSetting setting = FindSetting(value);
+                    if (setting != null && setting.IsToggle)
+                        setting.SetToggle(state.Draft.General, !setting.GetToggle(state.Draft.General));
+                    break;
+                }
+
+                case "give":
+                    GiveFromAdminPanel(player, state, value == "me");
+                    break;
+
+                case "test":
+                    TestDropFromAdminPanel(player, state);
+                    break;
+
+                case "save":
+                    SaveAdminPanel(player, state);
+                    break;
+
+                case "revert":
+                    state.Draft = CloneConfig();
+                    state.Status = "Changes reverted.";
+                    break;
+            }
+        }
+
+        private void GiveFromAdminPanel(BasePlayer player, AdminPanelState state, bool toSelf)
+        {
+            AnimalConfig saved = SavedAnimal(state);
+            if (saved == null)
+                return;
+
+            if (!toSelf && string.IsNullOrEmpty(state.GiveTarget))
+            {
+                SetAdminError(state, "Type a player name or Steam ID first.");
+                return;
+            }
+
+            string target = toSelf ? player.UserIDString : state.GiveTarget;
+            state.Status = GiveAnimal(player.UserIDString, new[] { target, saved.Name });
+        }
+
+        // Skips the plane: the animal starts at the configured altitude a few metres in front of the admin.
+        private void TestDropFromAdminPanel(BasePlayer player, AdminPanelState state)
+        {
+            AnimalConfig saved = SavedAnimal(state);
+            if (saved == null)
+                return;
+
+            if (HasUnsavedChanges(state))
+            {
+                SetAdminError(state, "Save your changes first. Test drops use the saved settings.");
+                return;
+            }
+
+            Vector3 forward = player.eyes.HeadForward();
+            forward.y = 0f;
+            Vector3 position = player.transform.position + forward.normalized * TestDropForwardDistance;
+            position.y = Mathf.Max(TerrainMeta.HeightMap.GetHeight(position), player.transform.position.y) + _config.General.DropAltitude;
+
+            PendingDrop pending = new PendingDrop { Animal = saved, OwnerId = player.userID, Id = ++_nextDropId, IsTest = true };
+            SpawnHerd(position, pending);
+            if (pending.AnimalsInFlight == 0)
+            {
+                SetAdminError(state, $"'{saved.Name}' could not be spawned. Check the server console.");
+                return;
+            }
+
+            Puts($"{player.displayName} [{player.UserIDString}] test dropped '{saved.Name}'.");
+            state.Status = $"Test drop started: {saved.Name}.";
+        }
+
+        private void RunDropAction(BasePlayer player, AdminPanelState state, string action, string[] args)
+        {
+            int id;
+            ActiveDrop drop = args.Length > 2 && int.TryParse(args[2], out id)
+                ? BuildActiveDrops().FirstOrDefault(d => d.Drop.Id == id)
+                : null;
+
+            if (drop == null)
+            {
+                SetAdminError(state, "That drop has already finished.");
+                return;
+            }
+
+            string animalName = drop.Drop.Animal.Name;
+            if (action == "tp")
+            {
+                player.EnsureDismounted();
+                player.Teleport(drop.Position + Vector3.up * 0.5f);
+                CloseAdminPanel(player);
+            }
+            else if (action == "land" && drop.CanLand)
+            {
+                foreach (DescentController descent in DescentsOf(drop.Drop))
+                    descent.ForceLand();
+
+                Puts($"{player.displayName} [{player.UserIDString}] landed '{animalName}' (drop {drop.Drop.Id}).");
+                state.Status = $"{animalName} landed.";
+            }
+            else if (action == "cancel" && drop.CanCancel)
+            {
+                CancelDrop(drop.Drop);
+                Puts($"{player.displayName} [{player.UserIDString}] cancelled '{animalName}' (drop {drop.Drop.Id}).");
+                state.Status = drop.Drop.IsTest ? $"Test drop of {animalName} cancelled." : $"{animalName} cancelled. The signal goes back to its owner.";
+            }
+        }
+
+        private void CancelDrop(PendingDrop pending)
+        {
+            foreach (BaseEntity signal in _armedSignals.Where(e => e.Value == pending).Select(e => e.Key).ToList())
+            {
+                _armedSignals.Remove(signal);
+                if (signal != null && !signal.IsDestroyed)
+                    signal.Kill();
+            }
+
+            foreach (CargoPlane plane in _planes.Where(e => e.Value == pending).Select(e => e.Key).ToList())
+            {
+                _planes.Remove(plane);
+                if (plane != null && !plane.IsDestroyed)
+                    plane.Kill();
+            }
+
+            // Refund first: it stops the smoke and clears the signal, so the animals below can't schedule another stop.
+            RefundDrop(pending, "an admin cancelled it", true);
+
+            foreach (DescentController descent in DescentsOf(pending))
+                descent.Cancel();
+        }
+
+        private List<DescentController> DescentsOf(PendingDrop pending)
+        {
+            return _descents.Where(d => d != null && d.InFlight && d.Drop == pending).ToList();
+        }
+
+        private List<ActiveDrop> BuildActiveDrops()
+        {
+            List<ActiveDrop> drops = new List<ActiveDrop>();
+
+            foreach (KeyValuePair<BaseEntity, PendingDrop> entry in _armedSignals)
+            {
+                if (entry.Key == null || entry.Key.IsDestroyed)
+                    continue;
+
+                drops.Add(new ActiveDrop
+                {
+                    Drop = entry.Value, Status = "SIGNAL THROWN", StatusColor = UiColor.Neutral, StatusTextColor = UiColor.Text,
+                    Detail = "Waiting for plane", Height = "-", Position = entry.Key.transform.position, CanCancel = true
+                });
+            }
+
+            foreach (KeyValuePair<CargoPlane, PendingDrop> entry in _planes)
+            {
+                CargoPlane plane = entry.Key;
+                if (plane == null || plane.IsDestroyed)
+                    continue;
+
+                Vector3 dropPoint = plane.dropPosition;
+                dropPoint.y = TerrainMeta.HeightMap.GetHeight(dropPoint);
+                int secondsLeft = Mathf.CeilToInt(Mathf.Max(0f, plane.secondsToTake * 0.5f - plane.secondsTaken));
+                drops.Add(new ActiveDrop
+                {
+                    Drop = entry.Value, Status = "PLANE INBOUND", StatusColor = UiColor.Blue, StatusTextColor = UiColor.White,
+                    Detail = $"Drop in {secondsLeft} s", Height = "-", Position = dropPoint, CanCancel = true
+                });
+            }
+
+            foreach (IGrouping<PendingDrop, DescentController> group in _descents.Where(d => d != null && d.InFlight).GroupBy(d => d.Drop))
+            {
+                DescentController first = group.First();
+                int balloons = group.Sum(d => d.BalloonsLeft);
+                drops.Add(new ActiveDrop
+                {
+                    Drop = group.Key, Status = "DESCENDING", StatusColor = UiColor.Amber, StatusTextColor = UiColor.Bar,
+                    Detail = balloons > 0 ? $"{balloons} balloons left" : "No balloons",
+                    Height = $"{Mathf.RoundToInt(group.Max(d => d.HeightAboveGround))} m",
+                    Position = first.GroundBelow, CanLand = true, CanCancel = !group.Key.AnyLanded
+                });
+            }
+
+            foreach (SmokeStop stop in _smokeStops)
+            {
+                int secondsLeft = Mathf.CeilToInt(Mathf.Max(0f, stop.EndsAt - Time.realtimeSinceStartup));
+                drops.Add(new ActiveDrop
+                {
+                    Drop = stop.Drop, Status = "LANDED", StatusColor = UiColor.Green, StatusTextColor = UiColor.OnGreen,
+                    Detail = $"Smoke stops in {secondsLeft} s", Height = "0 m", Position = stop.Position
+                });
+            }
+
+            return drops.OrderBy(d => d.Drop.Id).ToList();
+        }
+
+        private static List<ActiveDrop> VisibleDrops(AdminPanelState state, List<ActiveDrop> drops)
+        {
+            int lastPage = Mathf.Max(0, (drops.Count - 1) / ActiveDropsPerPage);
+            state.ActivePage = Mathf.Clamp(state.ActivePage, 0, lastPage);
+            return drops.Skip(state.ActivePage * ActiveDropsPerPage).Take(ActiveDropsPerPage).ToList();
+        }
+
+        // Everything that decides which rows and buttons exist. Heights and countdowns are updated in place.
+        private static string ActiveSignature(AdminPanelState state, List<ActiveDrop> drops)
+        {
+            return $"{drops.Count}|{state.ActivePage}|" + string.Join(",", VisibleDrops(state, drops).Select(d => $"{d.Drop.Id}:{d.Status}:{d.CanLand}:{d.CanCancel}").ToArray());
+        }
+
+        private static string ActiveTabText(int count) => count > 0 ? $"ACTIVE DROPS ({count})" : "ACTIVE DROPS";
+
+        private static string DropLabelName(int id, string field) => $"{UiBody}.Drop{id}.{field}";
+
+        private string DropOwnerName(PendingDrop drop)
+        {
+            BasePlayer owner = BasePlayer.FindAwakeOrSleepingByID(drop.OwnerId);
+            string name = owner != null ? owner.displayName : covalence.Players.FindPlayerById(drop.OwnerId.ToString())?.Name ?? drop.OwnerId.ToString();
+            if (name.Length > MaxDisplayedNameLength)
+                name = name.Substring(0, MaxDisplayedNameLength);
+
+            return drop.IsTest ? $"{name} (test)" : name;
+        }
+
+        // Sends only changed text: redrawing would lose typing on the other tabs and could swallow a click.
+        private void RefreshAdminPanels()
+        {
+            if (_adminPanels.Count == 0)
+                return;
+
+            List<ActiveDrop> drops = BuildActiveDrops();
+            foreach (ulong adminId in _adminPanels.Keys.ToList())
+            {
+                BasePlayer player = BasePlayer.FindByID(adminId);
+                if (player == null || !player.IsConnected)
+                    continue;
+
+                if (!permission.UserHasPermission(player.UserIDString, PermAdmin))
+                {
+                    CloseAdminPanel(player);
+                    continue;
+                }
+
+                AdminPanelState state = _adminPanels[adminId];
+                bool historyChanged = state.Tab == TabHistory && state.ShownHistoryVersion != _historyVersion;
+                if (historyChanged || (state.Tab == TabActive && state.ActiveSignature != ActiveSignature(state, drops)))
+                {
+                    DrawAdminPanel(player, state);
+                    continue;
+                }
+
+                CuiElementContainer updates = new CuiElementContainer();
+                if (state.ShownActiveCount != drops.Count)
+                {
+                    state.ShownActiveCount = drops.Count;
+                    UiUpdateLabel(updates, UiActiveTabLabel, ActiveTabText(drops.Count), 15, state.Tab == TabActive ? UiColor.White : UiColor.Text, TextAnchor.MiddleCenter, true);
+                }
+
+                if (state.Tab == TabActive)
+                {
+                    foreach (ActiveDrop drop in VisibleDrops(state, drops))
+                    {
+                        UiUpdateLabel(updates, DropLabelName(drop.Drop.Id, "Detail"), drop.Detail, 11, UiColor.Muted, TextAnchor.MiddleLeft);
+                        UiUpdateLabel(updates, DropLabelName(drop.Drop.Id, "Height"), drop.Height, 15, UiColor.Text, TextAnchor.MiddleLeft);
+                    }
+                }
+
+                if (updates.Count > 0)
+                    CuiHelper.AddUi(player, updates);
+            }
+        }
+
+        private void DrawActiveTab(CuiElementContainer c, AdminPanelState state, List<ActiveDrop> drops)
+        {
+            if (drops.Count == 0)
+            {
+                UiLabel(c, 24, 104, 900, 40, "No drops in progress.", 18, UiColor.Muted, TextAnchor.MiddleLeft);
+                return;
+            }
+
+            UiLabel(c, 40, 104, 200, 20, "ANIMAL", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 250, 104, 140, 20, "THROWN BY", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 400, 104, 150, 20, "STATUS", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 556, 104, 70, 20, "HEIGHT", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 630, 104, 60, 20, "GRID", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+
+            int top = 130;
+            foreach (ActiveDrop drop in VisibleDrops(state, drops))
+            {
+                UiPanel(c, 24, top, 952, 62, UiColor.Inset);
+                UiSignalIcon(c, 32, top + 7, 48, drop.Drop.Animal.SkinId);
+                UiLabel(c, 88, top, 156, 62, drop.Drop.Animal.Name, 15, UiColor.Text, TextAnchor.MiddleLeft, true);
+                UiLabel(c, 250, top, 144, 62, DropOwnerName(drop.Drop), 14, UiColor.Text, TextAnchor.MiddleLeft);
+                UiPanel(c, 400, top + 9, 124, 24, drop.StatusColor);
+                UiLabel(c, 400, top + 9, 124, 24, drop.Status, 12, drop.StatusTextColor, TextAnchor.MiddleCenter, true);
+                UiLabel(c, 400, top + 36, 150, 20, drop.Detail, 11, UiColor.Muted, TextAnchor.MiddleLeft, false, DropLabelName(drop.Drop.Id, "Detail"));
+                UiLabel(c, 556, top, 70, 62, drop.Height, 15, UiColor.Text, TextAnchor.MiddleLeft, false, DropLabelName(drop.Drop.Id, "Height"));
+                UiLabel(c, 630, top, 60, 62, MapHelper.PositionToString(drop.Position), 15, UiColor.Text, TextAnchor.MiddleLeft, true);
+
+                UiButton(c, 744, top + 10, 50, 42, UiColor.Neutral, "TP", 14, UiColor.Text, $"drop tp {drop.Drop.Id}");
+                if (drop.CanLand)
+                    UiButton(c, 800, top + 10, 90, 42, UiColor.Blue, "LAND NOW", 13, UiColor.White, $"drop land {drop.Drop.Id}");
+                if (drop.CanCancel)
+                    UiButton(c, 896, top + 10, 72, 42, UiColor.Red, "CANCEL", 13, UiColor.White, $"drop cancel {drop.Drop.Id}");
+
+                top += 68;
+            }
+        }
+
+        private void DrawHistoryTab(CuiElementContainer c, AdminPanelState state)
+        {
+            if (_history.Count == 0)
+            {
+                UiLabel(c, 24, 104, 900, 40, "No drops recorded yet.", 18, UiColor.Muted, TextAnchor.MiddleLeft);
+                return;
+            }
+
+            UiLabel(c, 34, 104, 110, 20, "TIME", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 150, 104, 170, 20, "ANIMAL", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 330, 104, 150, 20, "THROWN BY", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 486, 104, 50, 20, "GRID", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 540, 104, 100, 20, "RESULT", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 650, 104, 320, 20, "DETAILS", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+
+            int top = 126;
+            foreach (DropRecord record in VisibleHistory(state))
+            {
+                string badgeColor, badgeText;
+                HistoryBadge(record.Result, out badgeColor, out badgeText);
+
+                UiPanel(c, 24, top, 952, 34, UiColor.Inset);
+                UiLabel(c, 34, top, 110, 34, record.Time.ToString("dd MMM HH:mm", System.Globalization.CultureInfo.InvariantCulture), 13, UiColor.Muted, TextAnchor.MiddleLeft);
+                UiSignalIcon(c, 150, top + 3, 28, record.SkinId);
+                UiLabel(c, 184, top, 140, 34, record.Animal, 14, UiColor.Text, TextAnchor.MiddleLeft, true);
+                UiLabel(c, 330, top, 150, 34, record.OwnerName, 13, UiColor.Text, TextAnchor.MiddleLeft);
+                UiLabel(c, 486, top, 50, 34, record.Grid, 13, UiColor.Text, TextAnchor.MiddleLeft, true);
+                UiPanel(c, 540, top + 6, 100, 22, badgeColor);
+                UiLabel(c, 540, top + 6, 100, 22, record.Result, 11, badgeText, TextAnchor.MiddleCenter, true);
+                UiLabel(c, 650, top, 320, 34, record.Detail, 12, UiColor.Muted, TextAnchor.MiddleLeft);
+                top += 38;
+            }
+        }
+
+        private List<DropRecord> VisibleHistory(AdminPanelState state)
+        {
+            state.HistoryPage = Mathf.Clamp(state.HistoryPage, 0, LastPage(_history.Count, HistoryRowsPerPage));
+            return Enumerable.Reverse(_history).Skip(state.HistoryPage * HistoryRowsPerPage).Take(HistoryRowsPerPage).ToList();
+        }
+
+        private static int LastPage(int count, int perPage) => Mathf.Max(0, (count - 1) / perPage);
+
+        private static void HistoryBadge(string result, out string color, out string textColor)
+        {
+            switch (result)
+            {
+                case ResultLanded:
+                    color = UiColor.Green;
+                    textColor = UiColor.OnGreen;
+                    break;
+                case ResultRefunded:
+                    color = UiColor.Blue;
+                    textColor = UiColor.White;
+                    break;
+                case ResultCancelled:
+                    color = UiColor.Amber;
+                    textColor = UiColor.Bar;
+                    break;
+                default:
+                    color = UiColor.Red;
+                    textColor = UiColor.White;
+                    break;
+            }
+        }
+
+        private void SaveAdminPanel(BasePlayer player, AdminPanelState state)
+        {
+            List<AnimalConfig> drafts = state.Draft.Airdrops;
+            for (int i = 0; i < drafts.Count && i < _config.Airdrops.Count; i++)
+            {
+                AnimalConfig draft = drafts[i];
+                AnimalConfig saved = _config.Airdrops[i];
+
+                // Copied onto the live objects so drops already in the air keep working.
+                saved.Sex = draft.Sex;
+                saved.SpawnCount = draft.SpawnCount;
+                saved.Notification = draft.Notification;
+                saved.BalloonText = draft.BalloonText;
+                saved.WipeLimit = draft.WipeLimit;
+            }
+
+            _config.General = state.Draft.General;
+            SaveConfig();
+            state.Draft = CloneConfig();
+
+            // Balloon prefabs are only resolved at startup when balloons were enabled then.
+            if (_config.General.UseBalloons && _balloonPrefabs.Count == 0 && _speechBubblePrefab == null)
+                ResolveBalloonPrefabs();
+
+            Puts($"Settings saved from the admin panel by {player.displayName} [{player.UserIDString}].");
+            state.Status = "Saved. Changes apply to the next drop.";
+        }
+
+        private static void SetAdminError(AdminPanelState state, string message)
+        {
+            state.Status = message;
+            state.StatusIsError = true;
+        }
+
+        private PluginConfig CloneConfig() => JsonConvert.DeserializeObject<PluginConfig>(JsonConvert.SerializeObject(_config));
+
+        private bool HasUnsavedChanges(AdminPanelState state) => JsonConvert.SerializeObject(state.Draft) != JsonConvert.SerializeObject(_config);
+
+        private static AnimalConfig SelectedAnimal(AdminPanelState state)
+        {
+            List<AnimalConfig> animals = state.Draft.Airdrops;
+            return state.AnimalIndex >= 0 && state.AnimalIndex < animals.Count ? animals[state.AnimalIndex] : null;
+        }
+
+        private AnimalConfig SavedAnimal(AdminPanelState state)
+        {
+            return state.AnimalIndex >= 0 && state.AnimalIndex < _config.Airdrops.Count ? _config.Airdrops[state.AnimalIndex] : null;
+        }
+
+        // With one prefab and no male variant, a prefab that only comes in one sex can't honour the setting.
+        private static bool SexIsFixed(AnimalConfig animal)
+        {
+            if (!string.IsNullOrEmpty(animal.MalePrefabPath))
+                return false;
+
+            if (!PrefabExists(animal.PrefabPath))
+                return true;
+
+            GameObject prefab = GameManager.server.FindPrefab(animal.PrefabPath.ToLowerInvariant());
+            LivestockAnimal livestock = prefab != null ? prefab.GetComponent<LivestockAnimal>() : null;
+            return livestock == null || livestock.Form != LivestockAnimal.SexForm.Either;
+        }
+
+        private void OpenAdminPanel(BasePlayer player)
+        {
+            AdminPanelState state = new AdminPanelState { Draft = CloneConfig() };
+            _adminPanels[player.userID] = state;
+
+            CuiElementContainer root = new CuiElementContainer();
+            root.Add(new CuiPanel
+            {
+                Image = { Color = UiColor.Backdrop },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                CursorEnabled = true
+            }, "Overlay", UiRoot);
+
+            CuiHelper.DestroyUi(player, UiRoot);
+            CuiHelper.AddUi(player, root);
+            DrawAdminPanel(player, state);
+        }
+
+        private void CloseAdminPanel(BasePlayer player)
+        {
+            _adminPanels.Remove(player.userID);
+            CuiHelper.DestroyUi(player, UiRoot);
+        }
+
+        private void DrawAdminPanel(BasePlayer player, AdminPanelState state)
+        {
+            CuiElementContainer c = new CuiElementContainer();
+            c.Add(new CuiPanel
+            {
+                Image = { Color = UiColor.Panel },
+                RectTransform =
+                {
+                    AnchorMin = "0.5 0.5",
+                    AnchorMax = "0.5 0.5",
+                    OffsetMin = $"{-PanelWidth / 2} {-PanelHeight / 2}",
+                    OffsetMax = $"{PanelWidth / 2} {PanelHeight / 2}"
+                }
+            }, UiRoot, UiBody);
+
+            UiPanel(c, 0, 0, PanelWidth, 90, UiColor.Bar);
+            UiLabel(c, 20, 0, 260, 50, "LIVESTOCK AIRDROPS", 20, UiColor.Text, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 270, 0, 120, 50, $"v{Version}", 12, UiColor.Muted, TextAnchor.MiddleLeft);
+            UiButton(c, PanelWidth - 46, 6, 38, 38, UiColor.Red, "X", 16, UiColor.White, "close");
+
+            List<ActiveDrop> drops = BuildActiveDrops();
+            state.ShownActiveCount = drops.Count;
+            state.ActiveSignature = ActiveSignature(state, drops);
+
+            UiTab(c, state, 20, 120, TabAnimals, "ANIMALS");
+            UiTab(c, state, 144, 160, TabSettings, "DROP SETTINGS");
+            UiTab(c, state, 308, 200, TabActive, ActiveTabText(drops.Count), UiActiveTabLabel);
+            UiTab(c, state, 512, 110, TabHistory, "HISTORY");
+
+            state.ShownHistoryVersion = _historyVersion;
+            if (state.Tab == TabSettings)
+                DrawSettingsTab(c, state);
+            else if (state.Tab == TabActive)
+                DrawActiveTab(c, state, drops);
+            else if (state.Tab == TabHistory)
+                DrawHistoryTab(c, state);
+            else
+                DrawAnimalsTab(c, state);
+
+            bool activeTab = state.Tab == TabActive;
+            bool historyTab = state.Tab == TabHistory;
+            string defaultStatus = activeTab ? UiActiveStatus : historyTab ? UiHistoryStatus : UiDefaultStatus;
+            UiPanel(c, 0, FooterTop, PanelWidth, PanelHeight - FooterTop, UiColor.Bar);
+            UiLabel(c, 24, FooterTop, 700, 60, state.Status ?? defaultStatus, 14, state.StatusIsError ? UiColor.ErrorText : UiColor.Muted, TextAnchor.MiddleLeft);
+            if (activeTab)
+            {
+                UiPager(c, state.ActivePage, LastPage(drops.Count, ActiveDropsPerPage), "activepage");
+            }
+            else if (historyTab)
+            {
+                UiPager(c, state.HistoryPage, LastPage(_history.Count, HistoryRowsPerPage), "historypage");
+            }
+            else
+            {
+                UiButton(c, 758, FooterTop + 9, 100, 42, UiColor.Neutral, "REVERT", 15, UiColor.Text, "revert");
+                UiButton(c, 866, FooterTop + 9, 110, 42, UiColor.Green, "SAVE", 15, UiColor.OnGreen, "save");
+            }
+
+            CuiHelper.DestroyUi(player, UiBody);
+            CuiHelper.AddUi(player, c);
+        }
+
+        // Built from separate parts so the label can be updated without redrawing the button.
+        private void UiTab(CuiElementContainer c, AdminPanelState state, int x, int width, string tab, string label, string labelName = null)
+        {
+            bool selected = state.Tab == tab;
+            UiPanel(c, x, 50, width, 40, selected ? UiColor.TabSelected : UiColor.Tab);
+            UiLabel(c, x, 50, width, 40, label, 15, selected ? UiColor.White : UiColor.Text, TextAnchor.MiddleCenter, true, labelName);
+            UiButton(c, x, 50, width, 40, UiColor.Clear, "", 10, UiColor.Text, $"tab {tab}");
+        }
+
+        private static void UiPager(CuiElementContainer c, int page, int lastPage, string command)
+        {
+            if (lastPage == 0)
+                return;
+
+            UiLabel(c, 856, FooterTop, 60, 60, $"{page + 1} / {lastPage + 1}", 14, UiColor.Muted, TextAnchor.MiddleCenter);
+            if (page > 0)
+                UiButton(c, 800, FooterTop + 9, 52, 42, UiColor.Neutral, "<", 18, UiColor.Text, $"{command} -1");
+            if (page < lastPage)
+                UiButton(c, 924, FooterTop + 9, 52, 42, UiColor.Neutral, ">", 18, UiColor.Text, $"{command} 1");
+        }
+
+        private void DrawAnimalsTab(CuiElementContainer c, AdminPanelState state)
+        {
+            List<AnimalConfig> animals = state.Draft.Airdrops;
+            UiPanel(c, 0, 90, 250, FooterTop - 90, UiColor.Inset);
+
+            if (animals.Count == 0)
+            {
+                UiLabel(c, 274, 104, 700, 40, "No animals are configured.", 18, UiColor.Muted, TextAnchor.MiddleLeft);
+                return;
+            }
+
+            state.AnimalIndex = Mathf.Clamp(state.AnimalIndex, 0, animals.Count - 1);
+            DrawAnimalList(c, state, animals);
+            DrawAnimalEditor(c, state, animals[state.AnimalIndex]);
+        }
+
+        private void DrawAnimalList(CuiElementContainer c, AdminPanelState state, List<AnimalConfig> animals)
+        {
+            bool paged = animals.Count > MaxAnimalsWithoutPaging;
+            int pageSize = paged ? AnimalsPerPage : MaxAnimalsWithoutPaging;
+            int page = state.AnimalIndex / pageSize;
+            int rowTop = 102;
+
+            for (int i = page * pageSize; i < animals.Count && i < (page + 1) * pageSize; i++)
+            {
+                AnimalConfig animal = animals[i];
+                string sex = SexIsFixed(animal) ? "Fixed sex" : animal.Sex;
+                UiPanel(c, 12, rowTop, 226, 60, i == state.AnimalIndex ? UiColor.RowSelected : UiColor.Row);
+                UiSignalIcon(c, 18, rowTop + 6, 48, animal.SkinId);
+                UiLabel(c, 74, rowTop + 8, 160, 24, animal.Name, 15, UiColor.Text, TextAnchor.MiddleLeft, true);
+                UiLabel(c, 74, rowTop + 32, 160, 20, $"Spawns {animal.SpawnCount}, {sex}", 11, UiColor.Muted, TextAnchor.MiddleLeft);
+                UiButton(c, 12, rowTop, 226, 60, UiColor.Clear, "", 10, UiColor.Text, $"animal {i}");
+                rowTop += 66;
+            }
+
+            if (!paged)
+                return;
+
+            int lastPage = (animals.Count - 1) / pageSize;
+            UiLabel(c, 72, 470, 106, 40, $"{page + 1} / {lastPage + 1}", 14, UiColor.Muted, TextAnchor.MiddleCenter);
+            if (page > 0)
+                UiButton(c, 12, 470, 56, 40, UiColor.Neutral, "<", 18, UiColor.Text, $"animal {(page - 1) * pageSize}");
+            if (page < lastPage)
+                UiButton(c, 182, 470, 56, 40, UiColor.Neutral, ">", 18, UiColor.Text, $"animal {(page + 1) * pageSize}");
+        }
+
+        private void DrawAnimalEditor(CuiElementContainer c, AdminPanelState state, AnimalConfig animal)
+        {
+            UiSignalIcon(c, 274, 100, 62, animal.SkinId);
+            UiLabel(c, 346, 100, 620, 36, animal.Name, 24, UiColor.Text, TextAnchor.MiddleLeft, true);
+            UiLabel(c, 346, 136, 620, 22, $"Signal skin {animal.SkinId}", 12, UiColor.Muted, TextAnchor.MiddleLeft);
+
+            // Read-only: shop items call giveanimal by this name, so renaming here would break them.
+            UiLabel(c, 274, 176, 341, 18, "ANIMAL NAME", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiPanel(c, 274, 196, 341, 40, UiColor.Tab);
+            UiLabel(c, 284, 196, 321, 40, animal.Name, 15, UiColor.Muted, TextAnchor.MiddleLeft);
+            UiField(c, 635, 176, 341, "BALLOON TEXT", animal.BalloonText, 32, "text balloon");
+            UiField(c, 274, 242, 702, "NOTIFICATION MESSAGE", animal.Notification, 200, "text note");
+
+            UiLabel(c, 274, 308, 341, 18, "SEX", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            if (SexIsFixed(animal))
+            {
+                UiPanel(c, 274, 328, 341, 40, UiColor.Tab);
+                UiLabel(c, 286, 328, 320, 40, "Fixed by this animal type", 14, UiColor.Muted, TextAnchor.MiddleLeft);
+            }
+            else
+            {
+                string[] options = { "Random", "Male", "Female" };
+                for (int i = 0; i < options.Length; i++)
+                {
+                    bool selected = string.Equals(animal.Sex, options[i], System.StringComparison.OrdinalIgnoreCase);
+                    UiButton(c, 274 + i * 114, 328, 113, 40, selected ? UiColor.Green : UiColor.Tab, options[i], 14, selected ? UiColor.OnGreen : UiColor.Text, $"sex {options[i]}");
+                }
+            }
+
+            UiLabel(c, 635, 308, 341, 18, "SPAWN COUNT", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiStepper(c, 635, 328, 46, 40, 60, animal.SpawnCount.ToString(), "spawn -1", "spawn 1");
+
+            UiLabel(c, 812, 308, 164, 18, "LIMIT PER WIPE", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiStepper(c, 812, 328, 46, 40, 60, animal.WipeLimit > 0 ? animal.WipeLimit.ToString() : "None", "wipelimit -1", "wipelimit 1");
+
+            UiPanel(c, 274, 392, 702, 96, UiColor.Inset);
+            UiLabel(c, 288, 402, 400, 18, "GIVE AND TEST", 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiInput(c, 288, 428, 280, 44, state.GiveTarget, 64, "target");
+            UiButton(c, 576, 428, 110, 44, UiColor.Neutral, "GIVE SIGNAL", 14, UiColor.Text, "give target");
+            UiButton(c, 694, 428, 110, 44, UiColor.Neutral, "GIVE TO ME", 14, UiColor.Text, "give me");
+            UiButton(c, 812, 428, 150, 44, UiColor.Blue, "TEST DROP HERE", 14, UiColor.White, "test");
+        }
+
+        private void DrawSettingsTab(CuiElementContainer c, AdminPanelState state)
+        {
+            DrawSettingsColumn(c, state, 24, LeftSettingGroups);
+            DrawSettingsColumn(c, state, 508, RightSettingGroups);
+        }
+
+        private void DrawSettingsColumn(CuiElementContainer c, AdminPanelState state, int x, UiSettingGroup[] groups)
+        {
+            const int columnWidth = 468;
+            const int rowHeight = 38;
+            const int groupHeader = 38;
+            const int groupGap = 12;
+            const int columnBottom = 508;
+
+            int top = 104;
+            for (int g = 0; g < groups.Length; g++)
+            {
+                UiSettingGroup group = groups[g];
+                int height = g == groups.Length - 1 ? columnBottom - top : groupHeader + rowHeight * group.Settings.Length;
+                UiPanel(c, x, top, columnWidth, height, UiColor.Inset);
+                UiLabel(c, x + 14, top + 8, 300, 24, group.Title, 14, UiColor.Amber, TextAnchor.MiddleLeft, true);
+
+                int rowTop = top + groupHeader;
+                foreach (UiSetting setting in group.Settings)
+                {
+                    DrawSettingRow(c, state, x, rowTop, columnWidth, setting);
+                    rowTop += rowHeight;
+                }
+
+                top += height + groupGap;
+            }
+        }
+
+        private void DrawSettingRow(CuiElementContainer c, AdminPanelState state, int x, int top, int columnWidth, UiSetting setting)
+        {
+            const int controlHeight = 34;
+            UiLabel(c, x + 14, top, 290, 38, setting.Label, 14, UiColor.Text, TextAnchor.MiddleLeft);
+
+            if (setting.IsToggle)
+            {
+                bool on = setting.GetToggle(state.Draft.General);
+                UiButton(c, x + columnWidth - 88, top + 2, 74, controlHeight, on ? UiColor.Green : UiColor.Neutral, on ? "ON" : "OFF", 14, on ? UiColor.OnGreen : UiColor.Text, $"toggle {setting.Key}");
+                return;
+            }
+
+            string value = setting.GetNumber(state.Draft.General).ToString(setting.Format, System.Globalization.CultureInfo.InvariantCulture);
+            UiStepper(c, x + columnWidth - 150, top + 2, 38, controlHeight, 60, value, $"step {setting.Key} -1", $"step {setting.Key} 1");
+        }
+
+        private void UiStepper(CuiElementContainer c, int x, int top, int buttonWidth, int height, int valueWidth, string value, string decrease, string increase)
+        {
+            UiButton(c, x, top, buttonWidth, height, UiColor.Neutral, "-", 18, UiColor.Text, decrease);
+            UiPanel(c, x + buttonWidth + 2, top, valueWidth, height, UiColor.Field);
+            UiLabel(c, x + buttonWidth + 2, top, valueWidth, height, value, 15, UiColor.Text, TextAnchor.MiddleCenter, true);
+            UiButton(c, x + buttonWidth + valueWidth + 4, top, buttonWidth, height, UiColor.Neutral, "+", 18, UiColor.Text, increase);
+        }
+
+        private void UiField(CuiElementContainer c, int x, int top, int width, string label, string value, int limit, string command)
+        {
+            UiLabel(c, x, top, width, 18, label, 12, UiColor.Muted, TextAnchor.MiddleLeft, true);
+            UiInput(c, x, top + 20, width, 40, value, limit, command);
+        }
+
+        private static void UiInput(CuiElementContainer c, int x, int top, int width, int height, string value, int limit, string command)
+        {
+            UiPanel(c, x, top, width, height, UiColor.Field);
+
+            // The field must fill a holder exactly: Unity copies its offsets onto the caret, which is its child,
+            // so a field positioned by offsets draws its caret and selection in the wrong place.
+            string holder = CuiHelper.GetGuid();
+            c.Add(new CuiElement
+            {
+                Name = holder,
+                Parent = UiBody,
+                Components = { UiRect(x + 10, top, width - 20, height) }
+            });
+
+            c.Add(new CuiElement
+            {
+                Name = CuiHelper.GetGuid(),
+                Parent = holder,
+                Components =
+                {
+                    new CuiInputFieldComponent
+                    {
+                        Text = value ?? "",
+                        CharsLimit = limit,
+                        Command = $"{UiCommand} {command}",
+                        Font = UiRegular,
+                        FontSize = 15,
+                        Color = UiColor.Text,
+                        Align = TextAnchor.MiddleLeft,
+                        NeedsKeyboard = true
+                    },
+                    new CuiRectTransformComponent { AnchorMin = "0 0", AnchorMax = "1 1", OffsetMin = "0 0", OffsetMax = "0 0" }
+                }
+            });
+        }
+
+        private static void UiSignalIcon(CuiElementContainer c, int x, int top, int size, ulong skinId)
+        {
+            c.Add(new CuiElement
+            {
+                Name = CuiHelper.GetGuid(),
+                Parent = UiBody,
+                Components =
+                {
+                    new CuiImageComponent { ItemId = ItemManager.FindItemDefinition(SupplySignalShortname).itemid, SkinId = skinId },
+                    UiRect(x, top, size, size)
+                }
+            });
+        }
+
+        private static void UiPanel(CuiElementContainer c, int x, int top, int width, int height, string color)
+        {
+            CuiRectTransformComponent rect = UiRect(x, top, width, height);
+            c.Add(new CuiPanel
+            {
+                Image = { Color = color },
+                RectTransform = { AnchorMin = rect.AnchorMin, AnchorMax = rect.AnchorMax, OffsetMin = rect.OffsetMin, OffsetMax = rect.OffsetMax }
+            }, UiBody);
+        }
+
+        private static void UiLabel(CuiElementContainer c, int x, int top, int width, int height, string text, int size, string color, TextAnchor align, bool bold = false, string name = null)
+        {
+            CuiRectTransformComponent rect = UiRect(x, top, width, height);
+            c.Add(new CuiLabel
+            {
+                Text = { Text = text ?? "", FontSize = size, Color = color, Align = align, Font = bold ? UiBold : UiRegular },
+                RectTransform = { AnchorMin = rect.AnchorMin, AnchorMax = rect.AnchorMax, OffsetMin = rect.OffsetMin, OffsetMax = rect.OffsetMax }
+            }, UiBody, name);
+        }
+
+        private static void UiUpdateLabel(CuiElementContainer c, string name, string text, int size, string color, TextAnchor align, bool bold = false)
+        {
+            c.Add(new CuiElement
+            {
+                Name = name,
+                Parent = UiBody,
+                Update = true,
+                Components = { new CuiTextComponent { Text = text, FontSize = size, Color = color, Align = align, Font = bold ? UiBold : UiRegular } }
+            });
+        }
+
+        private static void UiButton(CuiElementContainer c, int x, int top, int width, int height, string color, string text, int size, string textColor, string command)
+        {
+            CuiRectTransformComponent rect = UiRect(x, top, width, height);
+            c.Add(new CuiButton
+            {
+                Button = { Color = color, Command = $"{UiCommand} {command}" },
+                Text = { Text = text, FontSize = size, Color = textColor, Align = TextAnchor.MiddleCenter, Font = UiBold },
+                RectTransform = { AnchorMin = rect.AnchorMin, AnchorMax = rect.AnchorMax, OffsetMin = rect.OffsetMin, OffsetMax = rect.OffsetMax }
+            }, UiBody);
+        }
+
+        // Positions are measured from the panel's top-left corner.
+        private static CuiRectTransformComponent UiRect(int x, int top, int width, int height)
+        {
+            return new CuiRectTransformComponent
+            {
+                AnchorMin = "0 0",
+                AnchorMax = "0 0",
+                OffsetMin = $"{x} {PanelHeight - top - height}",
+                OffsetMax = $"{x + width} {PanelHeight - top}"
+            };
+        }
+
+        #endregion
+
         #region Helpers
 
         private AnimalConfig FindAnimalBySkin(ulong skin)
@@ -1146,7 +2777,11 @@ namespace Oxide.Plugins
         private void PurgeDeadPlanes()
         {
             foreach (CargoPlane plane in _planes.Keys.Where(p => p == null || p.IsDestroyed).ToList())
+            {
+                PendingDrop undelivered = _planes[plane];
                 _planes.Remove(plane);
+                RefundDrop(undelivered, "the plane was destroyed before dropping its cargo");
+            }
         }
 
         #endregion
