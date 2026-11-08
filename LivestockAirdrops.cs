@@ -7,7 +7,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("Livestock Airdrops", "Swannie", "1.9.3")]
+    [Info("Livestock Airdrops", "Swannie", "1.9.4")]
     [Description("Skinned supply signals call a cargo plane that drops live livestock, carried down by party balloons.")]
     public class LivestockAirdrops : RustPlugin
     {
@@ -516,7 +516,7 @@ namespace Oxide.Plugins
             animal.Spawn();
 
             if (livestock != null && ownerId != 0 && _config.General.TrustThrower)
-                livestock.SetFamiliarity(ownerId, ConVar.Livestock.trustToLead, LivestockAnimal.FamiliarityReason.Purchased);
+                livestock.SetFamiliarity(ownerId, ConVar.Livestock.trustToLead);
 
             GeneralSettings settings = _config.General;
             DescentController descent = animal.gameObject.AddComponent<DescentController>();
